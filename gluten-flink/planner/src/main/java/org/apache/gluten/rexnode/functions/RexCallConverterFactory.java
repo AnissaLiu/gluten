@@ -119,6 +119,15 @@ public class RexCallConverterFactory {
           // substring returns an empty string. Start semantics (0 counts as 1,
           // negative counts from the end) already match Flink.
           Map.entry("SUBSTRING", Arrays.asList(() -> new SubstringRexCallConverter())),
+          // TRIM is normalized by Calcite to (flag, seek, str); the converter
+          // maps the flag to ltrim/rtrim/trim and reorders to (str, seek).
+          Map.entry("TRIM", Arrays.asList(() -> new TrimRexCallConverter())),
+          // LTRIM/RTRIM keep the Flink argument order (str[, seek]); the
+          // flinksql ltrim/rtrim signatures match as-is.
+          Map.entry("LTRIM", Arrays.asList(() -> new DefaultRexCallConverter("ltrim"))),
+          Map.entry("RTRIM", Arrays.asList(() -> new DefaultRexCallConverter("rtrim"))),
+          Map.entry("LPAD", Arrays.asList(() -> new DefaultRexCallConverter("lpad"))),
+          Map.entry("RPAD", Arrays.asList(() -> new DefaultRexCallConverter("rpad"))),
           Map.entry("COALESCE", Arrays.asList(() -> new DefaultRexCallConverter("coalesce"))));
 
   public static RexCallConverter getConverter(RexCall callNode, RexConversionContext context) {
