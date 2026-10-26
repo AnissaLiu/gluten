@@ -35,6 +35,7 @@ import org.apache.flink.table.types.logical.SymbolType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarCharType;
+import org.apache.flink.table.types.logical.YearMonthIntervalType;
 
 import java.util.List;
 import java.util.Map;
@@ -78,7 +79,10 @@ public class LogicalTypeConverter {
               }),
           Map.entry(
               DayTimeIntervalType.class,
-              logicalType -> new io.github.zhztheplayer.velox4j.type.BigIntType()),
+              logicalType -> new io.github.zhztheplayer.velox4j.type.IntervalDayTimeType()),
+          Map.entry(
+              YearMonthIntervalType.class,
+              logicalType -> new io.github.zhztheplayer.velox4j.type.IntervalYearMonthType()),
           Map.entry(
               DateType.class, logicalType -> new io.github.zhztheplayer.velox4j.type.DateType()),
           Map.entry(
