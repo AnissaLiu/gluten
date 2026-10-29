@@ -132,6 +132,7 @@ public class RexCallConverterFactory {
           Map.entry("RTRIM", Arrays.asList(() -> new TrimSeekRexCallConverter("rtrim"))),
           Map.entry("LPAD", Arrays.asList(() -> new DefaultRexCallConverter("lpad"))),
           Map.entry("RPAD", Arrays.asList(() -> new DefaultRexCallConverter("rpad"))),
+          Map.entry("IFNULL", Arrays.asList(() -> new ScalarOnlyRexCallConverter("ifnull"))),
           Map.entry("COALESCE", Arrays.asList(() -> new DefaultRexCallConverter("coalesce"))));
 
   public static RexCallConverter getConverter(RexCall callNode, RexConversionContext context) {

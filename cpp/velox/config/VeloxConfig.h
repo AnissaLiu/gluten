@@ -134,6 +134,7 @@ const uint64_t kVeloxMemReclaimMaxWaitMsDefault = 3600000; // 60min
 
 const std::string kHiveConnectorId = "test-hive";
 const std::string kIcebergConnectorId = "test-iceberg";
+const std::string kKafkaConnectorId = "kafka-stream";
 
 const std::string kVeloxCacheEnabled = "spark.gluten.sql.columnar.backend.velox.cacheEnabled";
 
@@ -168,6 +169,13 @@ const std::string kVeloxIOThreads = "spark.gluten.sql.columnar.backend.velox.IOT
 const std::string kVeloxAsyncTimeoutOnTaskStopping =
     "spark.gluten.sql.columnar.backend.velox.asyncTimeoutOnTaskStopping";
 const int32_t kVeloxAsyncTimeoutOnTaskStoppingDefault = 30000; // 30s
+
+// VeloxListenerApi resolves Spark defaults per process: executor task slots,
+// driver cores, or local master cores. Native callers that omit this setting
+// fall back to the number of task slots per executor. Values less than or equal to one use the serial build path
+// without creating a dedicated thread pool.
+const std::string kBroadcastHashTableBuildThreads =
+    "spark.gluten.sql.columnar.backend.velox.broadcastHashTableBuildThreads";
 
 // udf
 const std::string kVeloxUdfLibraryPaths = "spark.gluten.sql.columnar.backend.velox.internal.udfLibraryPaths";
