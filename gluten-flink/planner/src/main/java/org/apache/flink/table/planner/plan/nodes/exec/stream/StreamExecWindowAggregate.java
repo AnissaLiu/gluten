@@ -33,6 +33,7 @@ import io.github.zhztheplayer.velox4j.plan.PlanNode;
 import io.github.zhztheplayer.velox4j.plan.StatefulPlanNode;
 import io.github.zhztheplayer.velox4j.plan.StreamWindowAggregationNode;
 import io.github.zhztheplayer.velox4j.plan.StreamWindowPartitionFunctionSpec;
+import io.github.zhztheplayer.velox4j.stateful.KeyedStateSpec;
 
 import org.apache.flink.FlinkVersion;
 import org.apache.flink.api.dag.Transformation;
@@ -250,6 +251,14 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
                 null,
                 List.of())
             : null;
+    // KeyedStateSpec: the grouping key channels and types the native
+    // WindowAggregator builds its keyed state backend from (group-agg
+    // PR #13558 pattern).
+    List<io.github.zhztheplayer.velox4j.type.Type> keyTypes =
+        keyIndexes.stream()
+            .map(idx -> LogicalTypeConverter.toVLType(inputType.getChildren().get(idx)))
+            .collect(Collectors.toList());
+    KeyedStateSpec keyedStateSpec = new KeyedStateSpec(keyIndexes, keyTypes);
     PlanNode windowAgg =
         new StreamWindowAggregationNode(
             PlanNodeIdGenerator.newId(),
@@ -257,6 +266,8 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
             localAgg,
             keySelectorSpec,
             sliceAssignerSpec,
+            keyedStateSpec,
+            shiftTimeZone.getId(),
             ArithmeticUtils.gcd(size, slide),
             TimeZone.getTimeZone(shiftTimeZone).useDaylightTime(),
             false,
@@ -306,11 +317,13 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
             WINDOW_AGG_MEMORY_RATIO,
             false);
 
-    // set KeyType and Selector for state
-    // This key selector will be updated in OffloadedJobGraphGenerator to GlutenKeySelector as
-    // needed.
-    transform.setStateKeySelector(selector);
-    transform.setStateKeyType(selector.getProducedType());
+    // Keys are owned by the velox side (KeyedStateSpec feeds the C++ keyed
+    // state backend), and routing is decided by the C++ StreamPartition
+    // exchange whose target subtask rides in the record. Declaring a Flink
+    // state key selector here would make the runtime recompute the key group
+    // with Flink's hash scheme and disagree with the velox routing at
+    // parallelism > 1 (group-agg PR #13558 lesson). Keep the transformation
+    // non-keyed on the Flink side.
     return transform;
   }
 }
