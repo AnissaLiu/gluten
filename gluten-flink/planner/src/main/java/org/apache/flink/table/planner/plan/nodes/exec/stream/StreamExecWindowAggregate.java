@@ -43,6 +43,7 @@ import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
 import org.apache.flink.streaming.api.transformations.OneInputTransformation;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.logical.WindowingStrategy;
@@ -69,17 +70,16 @@ import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonCre
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
 
 import org.apache.calcite.rel.core.AggregateCall;
-import org.apache.commons.math3.util.ArithmeticUtils;
 
 import javax.annotation.Nullable;
 
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.TimeZone;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.util.Preconditions.checkArgument;
@@ -173,6 +173,13 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
   @Override
   protected Transformation<RowData> translateToPlanInternal(
       PlannerBase planner, ExecNodeConfig config) {
+    // TODO(L2): support update-stream input once retract-capable aggregate
+    // functions land; reject at translation time so update-stream queries
+    // fail loudly instead of silently mis-aggregating.
+    if (needRetraction) {
+      throw new TableException(
+          "GFV window TVF aggregation does not support update-stream input yet (needRetraction=true, L2)");
+    }
     final ExecEdge inputEdge = getInputEdges().get(0);
     final Transformation<RowData> inputTransform =
         (Transformation<RowData>) inputEdge.translateToPlan(planner);
@@ -206,6 +213,25 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
             .limit(aggCalls.length)
             .collect(Collectors.toList());
     List<Integer> keyIndexes = Arrays.stream(grouping).boxed().collect(Collectors.toList());
+    // Keyless windows (empty grouping): the keyed state backend requires at
+    // least one key channel (KeyedStateSpec hard constraint), so append a
+    // constant BIGINT column ("$keyless_key", always 0) to the input type
+    // and key on it - every row shares one key row, giving per-window
+    // global aggregation. The native operator materializes the column on
+    // each runtime batch (declared type is one column wider than the
+    // runtime vectors).
+    final boolean keyless = keyIndexes.isEmpty();
+    if (keyless) {
+      List<String> names = new ArrayList<>(inputType.getNames().size() + 1);
+      names.addAll(inputType.getNames());
+      names.add("$keyless_key");
+      List<io.github.zhztheplayer.velox4j.type.Type> children =
+          new ArrayList<>(inputType.getChildren().size() + 1);
+      children.addAll(inputType.getChildren());
+      children.add(new io.github.zhztheplayer.velox4j.type.BigIntType());
+      inputType = new io.github.zhztheplayer.velox4j.type.RowType(names, children);
+      keyIndexes = List.of(inputType.getChildren().size() - 1);
+    }
     PartitionFunctionSpec keySelectorSpec = new HashPartitionFunctionSpec(inputType, keyIndexes);
     // TODO: support more window types.
     Tuple5<Long, Long, Long, Integer, Integer> windowSpecParams =
@@ -253,11 +279,10 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
             : null;
     // KeyedStateSpec: the grouping key channels and types the native
     // WindowAggregator builds its keyed state backend from (group-agg
-    // PR #13558 pattern).
+    // PR #13558 pattern). The children are already velox4j types - do not
+    // re-convert them through LogicalTypeConverter.
     List<io.github.zhztheplayer.velox4j.type.Type> keyTypes =
-        keyIndexes.stream()
-            .map(idx -> LogicalTypeConverter.toVLType(inputType.getChildren().get(idx)))
-            .collect(Collectors.toList());
+        keyIndexes.stream().map(inputType.getChildren()::get).collect(Collectors.toList());
     KeyedStateSpec keyedStateSpec = new KeyedStateSpec(keyIndexes, keyTypes);
     PlanNode windowAgg =
         new StreamWindowAggregationNode(
@@ -268,8 +293,6 @@ public class StreamExecWindowAggregate extends StreamExecWindowAggregateBase {
             sliceAssignerSpec,
             keyedStateSpec,
             shiftTimeZone.getId(),
-            ArithmeticUtils.gcd(size, slide),
-            TimeZone.getTimeZone(shiftTimeZone).useDaylightTime(),
             false,
             size,
             slide,
