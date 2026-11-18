@@ -43,6 +43,44 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
+import io.github.zhztheplayer.velox4j.aggregate.Aggregate;
+import io.github.zhztheplayer.velox4j.aggregate.AggregateStep;
+import io.github.zhztheplayer.velox4j.expression.FieldAccessTypedExpr;
+import io.github.zhztheplayer.velox4j.plan.AggregationNode;
+import io.github.zhztheplayer.velox4j.plan.EmptyNode;
+import io.github.zhztheplayer.velox4j.plan.HashPartitionFunctionSpec;
+import io.github.zhztheplayer.velox4j.plan.PartitionFunctionSpec;
+import io.github.zhztheplayer.velox4j.plan.PlanNode;
+import io.github.zhztheplayer.velox4j.plan.StatefulPlanNode;
+import io.github.zhztheplayer.velox4j.plan.StreamWindowAggregationNode;
+import io.github.zhztheplayer.velox4j.plan.StreamWindowPartitionFunctionSpec;
+import io.github.zhztheplayer.velox4j.stateful.KeyedStateSpec;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.tuple.Tuple5;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
+import org.apache.flink.table.planner.plan.nodes.exec.ExecEdge;
+import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
+import org.apache.flink.table.planner.plan.utils.AggregateInfoList;
+import org.apache.flink.table.planner.plan.utils.AggregateUtil;
+import org.apache.flink.table.planner.plan.utils.KeySelectorUtil;
+import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
+import org.apache.flink.table.planner.utils.TableConfigUtils;
+import org.apache.flink.table.runtime.keyselector.RowDataKeySelector;
+import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
+import org.apache.flink.table.runtime.util.TimeWindowUtil;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.gluten.rexnode.AggregateCallConverter;
+import org.apache.gluten.rexnode.Utils;
+import org.apache.gluten.rexnode.WindowUtils;
+import org.apache.gluten.util.LogicalTypeConverter;
+import org.apache.gluten.util.PlanNodeIdGenerator;
+import static org.apache.flink.util.Preconditions.checkArgument;
 
 /** Stream {@link ExecNode} for window table-valued based global aggregate. */
 @ExecNodeMetadata(
@@ -56,6 +94,8 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public class StreamExecGlobalWindowAggregate extends StreamExecWindowAggregateBase {
 
   public static final String GLOBAL_WINDOW_AGGREGATE_TRANSFORMATION = "global-window-aggregate";
+
+  private static final long WINDOW_AGG_MEMORY_RATIO = 100;
 
   public static final String FIELD_NAME_LOCAL_AGG_INPUT_ROW_TYPE = "localAggInputRowType";
 
@@ -131,15 +171,153 @@ public class StreamExecGlobalWindowAggregate extends StreamExecWindowAggregateBa
   @Override
   protected Transformation<RowData> translateToPlanInternal(
       PlannerBase planner, ExecNodeConfig config) {
-    // TODO(L4): wire the two-stage local-global path (the global stage
-    // consumes local partial rows with the trailing windowEnd BIGINT
-    // column via addIntermediateResults, windowEndIndex = getSliceEnd());
-    // rejected at translation time until then - the single-stage
-    // StreamExecWindowAggregate path carries these queries.
-    // Note: the Flink-side transformation must stay non-keyed even when
-    // wired (group-agg PR #13558 lesson: a Flink state key selector
-    // conflicts with the velox key-group routing at parallelism > 1).
-    throw new TableException(
-        "GFV does not support the two-stage (local-global) window TVF aggregation plan yet (L4)");
+    if (needRetraction) {
+      throw new TableException(
+          "GFV window TVF aggregation does not support update-stream input yet (needRetraction=true, L2)");
+    }
+    final ExecEdge inputEdge = getInputEdges().get(0);
+    final Transformation<RowData> inputTransform =
+        (Transformation<RowData>) inputEdge.translateToPlan(planner);
+    // The input is the local stage's output: [keys, intermediate
+    // accumulator columns..., windowEnd(BIGINT)] (keyless: [intermediate
+    // accumulator columns..., windowEnd] with no key column - the
+    // exchange routes it SINGLETON and the keyless wrap below applies).
+    final RowType partialRowType = (RowType) inputEdge.getOutputType();
+
+    final ZoneId shiftTimeZone =
+        TimeWindowUtil.getShiftTimeZone(
+            windowing.getTimeAttributeType(), TableConfigUtils.getLocalTimeZone(config));
+    final AggregateInfoList aggInfoList =
+        AggregateUtil.deriveStreamWindowAggregateInfoList(
+            planner.getTypeFactory(),
+            localAggInputRowType,
+            JavaScalaConversionUtil.toScala(Arrays.asList(aggCalls)),
+            needRetraction,
+            windowing.getWindow(),
+            true);
+
+    // --- Begin Gluten-specific code changes (two-stage global side) ---
+    io.github.zhztheplayer.velox4j.type.RowType inputType =
+        (io.github.zhztheplayer.velox4j.type.RowType) LogicalTypeConverter.toVLType(partialRowType);
+    // Key channels resolved first (the keyless case reads it).
+    List<Integer> keyIndexes =
+        Arrays.stream(grouping).boxed().collect(Collectors.toList());
+    final boolean keyless = keyIndexes.isEmpty();
+    if (keyless) {
+      // Keyless: the exchange output has no key column (SINGLETON
+      // routing); wrap a constant "$keyless_key" channel at the end (see
+      // Utils.wrapKeylessInput) so the C++ wraps the column in addInput
+      // and keys on it.
+      inputType = Utils.wrapKeylessInput(inputType);
+      keyIndexes = List.of(inputType.getChildren().size() - 1);
+    }
+    io.github.zhztheplayer.velox4j.type.RowType outputType =
+        (io.github.zhztheplayer.velox4j.type.RowType) LogicalTypeConverter.toVLType(getOutputType());
+    // The aggregates reference the ORIGINAL raw input (the local's
+    // input): their rawInputTypes drive the C++ intermediate-type
+    // resolution; the kFinal branch skips field-name resolution and
+    // reads the intermediate columns at fixed positions.
+    io.github.zhztheplayer.velox4j.type.RowType rawInputType =
+        (io.github.zhztheplayer.velox4j.type.RowType) LogicalTypeConverter.toVLType(localAggInputRowType);
+    List<FieldAccessTypedExpr> groupingKeys = Utils.generateFieldAccesses(inputType, grouping);
+    List<Aggregate> aggregates = AggregateCallConverter.toAggregates(aggCalls, rawInputType);
+    // Window column positions in the Flink output layout (keys,
+    // aggregates, window_start/end); the velox output type IS the
+    // Flink output type, so the C++ writes window timestamps at these
+    // exact positions.
+    Tuple2<Integer, Integer> windowStartAndEndIndexes =
+        WindowUtils.getWindowStartAndEndIndexes(namedWindowProperties, (RowType) getOutputType());
+    List<String> aggNames = new ArrayList<>();
+    for (int i = 0; i < aggCalls.length; i++) {
+      aggNames.add("a" + i);
+    }
+    List<io.github.zhztheplayer.velox4j.type.Type> keyTypes = new ArrayList<>();
+    for (Integer idx : keyIndexes) {
+      keyTypes.add(inputType.getChildren().get(idx));
+    }
+    KeyedStateSpec keyedStateSpec = new KeyedStateSpec(keyIndexes, keyTypes);
+    PartitionFunctionSpec keySelectorSpec = new HashPartitionFunctionSpec(inputType, keyIndexes);
+
+    // The windowing is a SliceAttachedWindowingStrategy: the rowtime
+    // index points at the windowEnd column of the partial rows (the
+    // planner rule put it at the end of the local output).
+    Tuple5<Long, Long, Long, Integer, Integer> windowSpecParams =
+        WindowUtils.extractWindowParameters(windowing);
+    long size = windowSpecParams.f0;
+    long slide = windowSpecParams.f1;
+    long offset = windowSpecParams.f2;
+    int rowtimeIndex = windowSpecParams.f3;
+    int windowType = windowSpecParams.f4;
+    PartitionFunctionSpec sliceAssignerSpec =
+        new StreamWindowPartitionFunctionSpec(
+            inputType, rowtimeIndex, size, slide, offset, windowType);
+
+    // The global's aggregation: FINAL step - consumes the intermediate
+    // columns, produces final values.
+    PlanNode aggregation =
+        new AggregationNode(
+            PlanNodeIdGenerator.newId(),
+            AggregateStep.FINAL,
+            groupingKeys,
+            groupingKeys,
+            aggNames,
+            aggregates,
+            false,
+            List.of(new EmptyNode(inputType)),
+            null,
+            List.of());
+
+    PlanNode windowAgg =
+        new StreamWindowAggregationNode(
+            PlanNodeIdGenerator.newId(),
+            aggregation,
+            null,
+            keySelectorSpec,
+            sliceAssignerSpec,
+            keyedStateSpec,
+            shiftTimeZone.getId(),
+            false,
+            size,
+            slide,
+            offset,
+            windowType,
+            outputType,
+            windowing.isRowtime(),
+            rowtimeIndex,
+            windowStartAndEndIndexes.f0,
+            windowStartAndEndIndexes.f1);
+
+    LogicalType[] accTypes =
+        Arrays.stream(aggInfoList.getAccTypes())
+            .map(x -> x.getLogicalType())
+            .collect(Collectors.toList())
+            .toArray(new LogicalType[] {});
+    final RowDataKeySelector selector =
+        KeySelectorUtil.getRowDataSelector(
+            planner.getFlinkContext().getClassLoader(),
+            grouping,
+            InternalTypeInfo.of(partialRowType));
+    final OneInputStreamOperator<RowData, RowData> windowOperator =
+        new org.apache.gluten.table.runtime.operators.WindowAggOperator<RowData, RowData, Long>(
+            new StatefulPlanNode(windowAgg.getId(), windowAgg),
+            PlanNodeIdGenerator.newId(),
+            inputType,
+            Map.of(windowAgg.getId(), outputType),
+            RowData.class,
+            RowData.class,
+            "StreamExecGlobalWindowAggregate",
+            selector.getProducedType(),
+            aggInfoList.getAggNames(),
+            accTypes);
+    // --- End Gluten-specific code changes ---
+
+    return ExecNodeUtil.createOneInputTransformation(
+        inputTransform,
+        createTransformationMeta(GLOBAL_WINDOW_AGGREGATE_TRANSFORMATION, config),
+        SimpleOperatorFactory.of(windowOperator),
+        InternalTypeInfo.of(getOutputType()),
+        inputTransform.getParallelism(),
+        WINDOW_AGG_MEMORY_RATIO,
+        false);
   }
 }
