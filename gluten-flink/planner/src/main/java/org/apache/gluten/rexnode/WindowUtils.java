@@ -76,6 +76,11 @@ public class WindowUtils {
       windowType = 3;
     } else if (windowSpec instanceof SessionWindowSpec) {
       windowType = 2;
+      // The session gap rides the size field; step/offset stay unset
+      // (velox WindowAggregator SESSION reads gap = size). CUMULATE
+      // stays deferred upstream of this branch: the type code alone
+      // keeps it failing loud in the operator (L5).
+      size = ((SessionWindowSpec) windowSpec).getGap().toMillis();
     } else {
       throw new RuntimeException("Not support window spec " + windowSpec);
     }
